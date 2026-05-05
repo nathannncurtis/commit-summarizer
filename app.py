@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import sys
+import time
 from logging.handlers import RotatingFileHandler
 
 import requests
@@ -18,17 +19,21 @@ load_dotenv()
 # Configuration
 GITHUB_WEBHOOK_SECRET = os.environ["GITHUB_WEBHOOK_SECRET"]
 SLACK_WEBHOOK_URL = os.environ["SLACK_WEBHOOK_URL"]
+SLACK_SIGNING_SECRET = os.environ["SLACK_SIGNING_SECRET"]
+SLACK_ALLOWED_CHANNEL_ID = os.environ["SLACK_ALLOWED_CHANNEL_ID"]
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:3b")
 PORT = int(os.getenv("PORT", "5000"))
-BIND_HOST = os.getenv("BIND_HOST", "0.0.0.0")
+BIND_HOST = os.getenv("BIND_HOST", "100.105.195.86")
+
+PAUSE_FLAG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".paused")
 
 app = Flask(__name__)
 
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
-LOG_PATH = os.getenv("LOG_PATH", "commit-summarizer.log")
+LOG_PATH = os.path.expanduser("~/logs/commit-summarizer.log")
 os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
 
 handler = RotatingFileHandler(LOG_PATH, maxBytes=5_000_000, backupCount=3)
@@ -56,6 +61,31 @@ def verify_signature(req: Request) -> bool:
         hashlib.sha256,
     ).hexdigest()
     return hmac.compare_digest(expected, signature_header)
+
+
+def verify_slack_signature(req: Request) -> bool:
+    """Verify Slack request signature (HMAC-SHA256, v0 scheme)."""
+    timestamp = req.headers.get("X-Slack-Request-Timestamp", "")
+    signature = req.headers.get("X-Slack-Signature", "")
+    if not timestamp or not signature:
+        return False
+    try:
+        if abs(time.time() - int(timestamp)) > 60 * 5:
+            return False
+    except ValueError:
+        return False
+    body = req.get_data(as_text=True)
+    basestring = f"v0:{timestamp}:{body}"
+    expected = "v0=" + hmac.new(
+        SLACK_SIGNING_SECRET.encode(),
+        basestring.encode(),
+        hashlib.sha256,
+    ).hexdigest()
+    return hmac.compare_digest(expected, signature)
+
+
+def is_paused() -> bool:
+    return os.path.exists(PAUSE_FLAG_PATH)
 
 
 def extract_push_data(payload: dict) -> dict:
@@ -205,9 +235,19 @@ def webhook():
         data["repo"], data["branch"], data["pusher"], len(data["commits"]),
     )
 
+    # Only summarize pushes to the default (main) branch
+    default_branch = payload.get("repository", {}).get("default_branch", "main")
+    if data["branch"] != default_branch:
+        logger.info("Ignoring push to non-default branch %s (default: %s)", data["branch"], default_branch)
+        return jsonify({"status": "skipped", "reason": "non-default branch"}), 200
+
     if not data["commits"]:
         logger.info("No commits in push (branch delete?), skipping")
         return jsonify({"status": "skipped", "reason": "no commits"}), 200
+
+    if is_paused():
+        logger.info("Service is paused, skipping summary for %s/%s", data["repo"], data["branch"])
+        return jsonify({"status": "skipped", "reason": "paused"}), 200
 
     # Summarize with Ollama
     commit_text = build_commit_text(data)
@@ -225,9 +265,53 @@ def webhook():
     return jsonify({"status": "ok", "slack_posted": slack_ok}), 200
 
 
+@app.route("/slack/command", methods=["POST"])
+def slack_command():
+    if not verify_slack_signature(request):
+        logger.warning("Invalid Slack signature from %s", request.remote_addr)
+        abort(403)
+
+    channel_id = request.form.get("channel_id", "")
+    if channel_id != SLACK_ALLOWED_CHANNEL_ID:
+        logger.info("Rejected slash command from channel %s (not allowed)", channel_id)
+        return jsonify({
+            "response_type": "ephemeral",
+            "text": "This command can only be used in the configured channel.",
+        }), 200
+
+    command = request.form.get("command", "")
+    user = request.form.get("user_name", "unknown")
+
+    if command == "/pause":
+        with open(PAUSE_FLAG_PATH, "w") as f:
+            f.write(f"paused by {user} at {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        logger.info("Paused by %s", user)
+        return jsonify({
+            "response_type": "in_channel",
+            "text": f":pause_button: Commit summaries paused by @{user}.",
+        }), 200
+
+    if command == "/resume":
+        try:
+            os.remove(PAUSE_FLAG_PATH)
+            logger.info("Resumed by %s", user)
+            text = f":arrow_forward: Commit summaries resumed by @{user}."
+        except FileNotFoundError:
+            text = "Commit summaries are already running."
+        return jsonify({"response_type": "in_channel", "text": text}), 200
+
+    return jsonify({
+        "response_type": "ephemeral",
+        "text": f"Unknown command: {command}",
+    }), 200
+
+
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "healthy"}), 200
+    return jsonify({
+        "status": "healthy",
+        "paused": is_paused(),
+    }), 200
 
 
 if __name__ == "__main__":

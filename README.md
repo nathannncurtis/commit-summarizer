@@ -15,7 +15,7 @@ Designed for teams where non-technical stakeholders want to stay informed about 
 
 - Python 3.10+
 - [Ollama](https://ollama.com) running locally with a model pulled (default: `qwen2.5:3b`)
-- A Slack incoming webhook URL
+- A Slack app with an incoming webhook (for posting summaries) and slash commands (for `/pause` and `/resume`)
 - A GitHub webhook secret
 
 ## Setup
@@ -79,10 +79,26 @@ In your repo: Settings → Webhooks → Add webhook
 | Secret | *(your GITHUB_WEBHOOK_SECRET)* |
 | Events | Just the push event |
 
+### 6. Configure Slack slash commands (optional)
+
+To pause and resume summaries from Slack, add two slash commands to your Slack app:
+
+1. https://api.slack.com/apps → your app → **Slash Commands** → **Create New Command**
+   - Command: `/pause`
+   - Request URL: `https://your-domain.com/slack/command`
+   - Save
+2. Repeat for `/resume` (same Request URL)
+3. **Basic Information** → copy the **Signing Secret** into `SLACK_SIGNING_SECRET`
+4. Get the channel ID where the commands are allowed (right-click the channel → View channel details → bottom of the panel) and put it in `SLACK_ALLOWED_CHANNEL_ID`
+5. Reinstall the app to your workspace if Slack prompts you
+
+When paused, the service still ACKs GitHub webhooks but skips the Ollama summary and the Slack post.
+
 ## Endpoints
 
 - `POST /webhook` — GitHub webhook receiver
-- `GET /health` — Health check
+- `POST /slack/command` — Slack slash command handler (`/pause`, `/resume`)
+- `GET /health` — Health check (returns `paused` status)
 
 ## License
 
