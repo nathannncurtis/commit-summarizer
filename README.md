@@ -102,4 +102,4 @@ When paused, the service still ACKs GitHub webhooks but skips the Ollama summary
 
 ## License
 
-MIT
+AGPL 3.0
