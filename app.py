@@ -30,6 +30,11 @@ SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")
 SLACK_ADMIN_USER_ID = os.getenv("SLACK_ADMIN_USER_ID", "")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:3b")
+OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "120"))
+# Ollama keep_alive: how long model weights stay loaded after a request.
+# Set to 0 to unload immediately (keeps idle weights out of swap), or a
+# duration like "5m". Empty = Ollama's default.
+OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "")
 PORT = int(os.getenv("PORT", "5000"))
 BIND_HOST = os.getenv("BIND_HOST", "100.105.195.86")
 
@@ -149,11 +154,17 @@ SUMMARY_SYSTEM_PROMPT = (
 
 def chat_with_ollama(messages: list) -> str | None:
     """Send a chat request to Ollama; return the reply text or None on failure."""
+    payload = {"model": OLLAMA_MODEL, "stream": False, "messages": messages}
+    if OLLAMA_KEEP_ALIVE != "":
+        try:
+            payload["keep_alive"] = int(OLLAMA_KEEP_ALIVE)
+        except ValueError:
+            payload["keep_alive"] = OLLAMA_KEEP_ALIVE
     try:
         resp = requests.post(
             f"{OLLAMA_URL}/api/chat",
-            json={"model": OLLAMA_MODEL, "stream": False, "messages": messages},
-            timeout=120,
+            json=payload,
+            timeout=OLLAMA_TIMEOUT,
         )
         resp.raise_for_status()
         return resp.json()["message"]["content"].strip()
