@@ -7,7 +7,9 @@ import json
 import logging
 import os
 import sys
+import threading
 import time
+from collections import deque
 from logging.handlers import RotatingFileHandler
 
 import requests
@@ -18,15 +20,25 @@ load_dotenv()
 
 # Configuration
 GITHUB_WEBHOOK_SECRET = os.environ["GITHUB_WEBHOOK_SECRET"]
-SLACK_WEBHOOK_URL = os.environ["SLACK_WEBHOOK_URL"]
 SLACK_SIGNING_SECRET = os.environ["SLACK_SIGNING_SECRET"]
 SLACK_ALLOWED_CHANNEL_ID = os.environ["SLACK_ALLOWED_CHANNEL_ID"]
+# Preferred: post as the app's bot user so messages can be edited later.
+# Fallback: legacy incoming webhook (messages posted this way are NOT editable).
+SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN", "")
+SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")
+# Only DMs from this Slack user ID may trigger summary edits.
+SLACK_ADMIN_USER_ID = os.getenv("SLACK_ADMIN_USER_ID", "")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:3b")
 PORT = int(os.getenv("PORT", "5000"))
 BIND_HOST = os.getenv("BIND_HOST", "100.105.195.86")
 
-PAUSE_FLAG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".paused")
+if not SLACK_BOT_TOKEN and not SLACK_WEBHOOK_URL:
+    raise SystemExit("Set SLACK_BOT_TOKEN (preferred) or SLACK_WEBHOOK_URL in the environment")
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+PAUSE_FLAG_PATH = os.path.join(BASE_DIR, ".paused")
+LAST_POST_PATH = os.path.join(BASE_DIR, "last_post.json")
 
 app = Flask(__name__)
 
@@ -128,80 +140,218 @@ def build_commit_text(data: dict) -> str:
     return "\n".join(lines)
 
 
-def summarize_with_ollama(commit_text: str) -> str:
-    """Send commit data to Ollama and return a plain-English summary."""
-    system_prompt = (
-        "You are summarizing software changes for a non-technical business audience. "
-        "Be concise, explain what changed and why it matters in 2-3 sentences. "
-        "Do not use technical jargon. Do not repeat the raw commit data."
-    )
+SUMMARY_SYSTEM_PROMPT = (
+    "You are summarizing software changes for a non-technical business audience. "
+    "Be concise, explain what changed and why it matters in 2-3 sentences. "
+    "Do not use technical jargon. Do not repeat the raw commit data."
+)
+
+
+def chat_with_ollama(messages: list) -> str | None:
+    """Send a chat request to Ollama; return the reply text or None on failure."""
     try:
         resp = requests.post(
             f"{OLLAMA_URL}/api/chat",
-            json={
-                "model": OLLAMA_MODEL,
-                "stream": False,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": f"Summarize these code changes:\n\n{commit_text}"},
-                ],
-            },
+            json={"model": OLLAMA_MODEL, "stream": False, "messages": messages},
             timeout=120,
         )
         resp.raise_for_status()
         return resp.json()["message"]["content"].strip()
     except requests.RequestException as exc:
         logger.error("Ollama request failed: %s", exc)
-        return "(AI summary unavailable — Ollama could not be reached.)"
+        return None
     except (KeyError, ValueError) as exc:
         logger.error("Unexpected Ollama response: %s", exc)
-        return "(AI summary unavailable — unexpected response from Ollama.)"
+        return None
 
 
-def post_to_slack(data: dict, summary: str) -> bool:
-    """Post a formatted message to Slack via incoming webhook."""
-    num_commits = len(data["commits"])
-    commit_word = "commit" if num_commits == 1 else "commits"
+def summarize_with_ollama(commit_text: str) -> str:
+    """Send commit data to Ollama and return a plain-English summary."""
+    reply = chat_with_ollama([
+        {"role": "system", "content": SUMMARY_SYSTEM_PROMPT},
+        {"role": "user", "content": f"Summarize these code changes:\n\n{commit_text}"},
+    ])
+    return reply or "(AI summary unavailable — Ollama could not be reached.)"
 
-    slack_payload = {
-        "blocks": [
-            {
-                "type": "header",
-                "text": {
-                    "type": "plain_text",
-                    "text": f"New push to {data['repo']}",
-                },
-            },
-            {
-                "type": "section",
-                "fields": [
-                    {"type": "mrkdwn", "text": f"*Branch:*\n`{data['branch']}`"},
-                    {"type": "mrkdwn", "text": f"*Pushed by:*\n{data['pusher']}"},
-                    {"type": "mrkdwn", "text": f"*Commits:*\n{num_commits} {commit_word}"},
-                ],
-            },
-            {"type": "divider"},
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": f"*Summary*\n{summary}",
-                },
-            },
-        ],
-    }
 
+def revise_with_ollama(commit_text: str, prev_summary: str, instruction: str) -> str | None:
+    """Rewrite a summary using a correction from the maintainer."""
+    return chat_with_ollama([
+        {"role": "system", "content": SUMMARY_SYSTEM_PROMPT},
+        {"role": "user", "content": (
+            "You previously summarized these code changes:\n\n"
+            f"{commit_text}\n\n"
+            f"Your summary was:\n{prev_summary}\n\n"
+            "The maintainer says the summary is wrong and gave this correction. "
+            "Treat the correction as ground truth even where it contradicts the "
+            "commit data, and write a replacement summary:\n"
+            f"{instruction}"
+        )},
+    ])
+
+
+# ---------------------------------------------------------------------------
+# Slack posting
+# ---------------------------------------------------------------------------
+
+def slack_api(method: str, payload: dict) -> dict:
+    """Call a Slack Web API method with the bot token."""
     try:
         resp = requests.post(
-            SLACK_WEBHOOK_URL,
-            json=slack_payload,
+            f"https://slack.com/api/{method}",
+            json=payload,
+            headers={
+                "Authorization": f"Bearer {SLACK_BOT_TOKEN}",
+                "Content-Type": "application/json; charset=utf-8",
+            },
             timeout=15,
         )
+        resp.raise_for_status()
+        body = resp.json()
+    except (requests.RequestException, ValueError) as exc:
+        logger.error("Slack %s request failed: %s", method, exc)
+        return {"ok": False, "error": str(exc)}
+    if not body.get("ok"):
+        logger.error("Slack %s returned error: %s", method, body.get("error"))
+    return body
+
+
+def build_summary_blocks(meta: dict, summary: str) -> list:
+    num_commits = meta["num_commits"]
+    commit_word = "commit" if num_commits == 1 else "commits"
+    return [
+        {
+            "type": "header",
+            "text": {
+                "type": "plain_text",
+                "text": f"New push to {meta['repo']}",
+            },
+        },
+        {
+            "type": "section",
+            "fields": [
+                {"type": "mrkdwn", "text": f"*Branch:*\n`{meta['branch']}`"},
+                {"type": "mrkdwn", "text": f"*Pushed by:*\n{meta['pusher']}"},
+                {"type": "mrkdwn", "text": f"*Commits:*\n{num_commits} {commit_word}"},
+            ],
+        },
+        {"type": "divider"},
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"*Summary*\n{summary}",
+            },
+        },
+    ]
+
+
+def save_last_post(record: dict) -> None:
+    with open(LAST_POST_PATH, "w") as f:
+        json.dump(record, f, indent=2)
+
+
+def load_last_post() -> dict | None:
+    try:
+        with open(LAST_POST_PATH) as f:
+            return json.load(f)
+    except (FileNotFoundError, ValueError):
+        return None
+
+
+def post_to_slack(data: dict, summary: str, commit_text: str) -> bool:
+    """Post a summary to Slack.
+
+    Uses chat.postMessage when a bot token is configured (so the message can be
+    edited later via DM), otherwise falls back to the legacy incoming webhook.
+    """
+    meta = {
+        "repo": data["repo"],
+        "branch": data["branch"],
+        "pusher": data["pusher"],
+        "num_commits": len(data["commits"]),
+    }
+    blocks = build_summary_blocks(meta, summary)
+    fallback_text = f"New push to {meta['repo']} — {summary}"
+
+    if SLACK_BOT_TOKEN:
+        body = slack_api("chat.postMessage", {
+            "channel": SLACK_ALLOWED_CHANNEL_ID,
+            "text": fallback_text,
+            "blocks": blocks,
+        })
+        if not body.get("ok"):
+            return False
+        save_last_post({
+            "ts": body["ts"],
+            "channel": body["channel"],
+            "meta": meta,
+            "commit_text": commit_text,
+            "summary": summary,
+        })
+        return True
+
+    try:
+        resp = requests.post(SLACK_WEBHOOK_URL, json={"blocks": blocks}, timeout=15)
         resp.raise_for_status()
         return True
     except requests.RequestException as exc:
         logger.error("Slack post failed: %s", exc)
         return False
+
+
+# ---------------------------------------------------------------------------
+# DM-driven summary edits
+# ---------------------------------------------------------------------------
+
+_seen_event_ids: set = set()
+_seen_event_order: deque = deque()
+
+
+def _event_already_seen(event_id: str) -> bool:
+    """Dedupe Slack event redeliveries (bounded memory)."""
+    if not event_id or event_id in _seen_event_ids:
+        return bool(event_id)
+    _seen_event_ids.add(event_id)
+    _seen_event_order.append(event_id)
+    while len(_seen_event_order) > 500:
+        _seen_event_ids.discard(_seen_event_order.popleft())
+    return False
+
+
+def send_dm(channel: str, text: str) -> None:
+    slack_api("chat.postMessage", {"channel": channel, "text": text})
+
+
+def handle_edit_request(instruction: str, dm_channel: str) -> None:
+    """Revise the last posted summary per the maintainer's DM and edit it in place."""
+    last = load_last_post()
+    if not last:
+        send_dm(dm_channel, "I don't have an editable summary on record yet — "
+                            "only messages posted after the bot-token upgrade can be edited.")
+        return
+
+    logger.info("Edit requested for ts=%s: %s", last["ts"], instruction)
+    new_summary = revise_with_ollama(last["commit_text"], last["summary"], instruction)
+    if not new_summary:
+        send_dm(dm_channel, "Couldn't generate a revised summary — Ollama is unreachable. "
+                            "The channel message is unchanged.")
+        return
+
+    body = slack_api("chat.update", {
+        "channel": last["channel"],
+        "ts": last["ts"],
+        "text": f"New push to {last['meta']['repo']} — {new_summary}",
+        "blocks": build_summary_blocks(last["meta"], new_summary),
+    })
+    if body.get("ok"):
+        last["summary"] = new_summary
+        save_last_post(last)
+        logger.info("Summary ts=%s updated", last["ts"])
+        send_dm(dm_channel, f"Done — updated the summary in <#{last['channel']}>:\n\n{new_summary}")
+    else:
+        send_dm(dm_channel, f"Slack refused the edit ({body.get('error')}). "
+                            "The channel message is unchanged.")
 
 
 # ---------------------------------------------------------------------------
@@ -256,13 +406,54 @@ def webhook():
     logger.info("Summary: %s", summary)
 
     # Post to Slack
-    slack_ok = post_to_slack(data, summary)
+    slack_ok = post_to_slack(data, summary, commit_text)
     if slack_ok:
         logger.info("Posted to Slack successfully")
     else:
         logger.error("Failed to post to Slack")
 
     return jsonify({"status": "ok", "slack_posted": slack_ok}), 200
+
+
+@app.route("/slack/events", methods=["POST"])
+def slack_events():
+    if not verify_slack_signature(request):
+        logger.warning("Invalid Slack signature from %s", request.remote_addr)
+        abort(403)
+
+    payload = request.get_json(silent=True) or {}
+
+    # One-time URL verification handshake when enabling Event Subscriptions
+    if payload.get("type") == "url_verification":
+        return jsonify({"challenge": payload.get("challenge", "")}), 200
+
+    if payload.get("type") != "event_callback":
+        return "", 200
+    if _event_already_seen(payload.get("event_id", "")):
+        return "", 200
+
+    event = payload.get("event", {})
+    # Only plain DMs from the configured maintainer; ignore our own replies
+    if event.get("type") != "message" or event.get("channel_type") != "im":
+        return "", 200
+    if event.get("bot_id") or event.get("subtype"):
+        return "", 200
+    if not SLACK_ADMIN_USER_ID or event.get("user") != SLACK_ADMIN_USER_ID:
+        logger.info("Ignoring DM from user %s (not the configured admin)", event.get("user"))
+        return "", 200
+
+    instruction = (event.get("text") or "").strip()
+    if not instruction:
+        return "", 200
+
+    # Slack expects an ACK within 3 seconds; the Ollama rewrite takes longer,
+    # so do the work in the background and reply via DM when done.
+    threading.Thread(
+        target=handle_edit_request,
+        args=(instruction, event.get("channel", "")),
+        daemon=True,
+    ).start()
+    return "", 200
 
 
 @app.route("/slack/command", methods=["POST"])
@@ -311,6 +502,7 @@ def health():
     return jsonify({
         "status": "healthy",
         "paused": is_paused(),
+        "editable_posts": bool(SLACK_BOT_TOKEN),
     }), 200
 
 

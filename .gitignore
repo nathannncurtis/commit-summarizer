@@ -1,0 +1,6 @@
+.env
+.paused
+last_post.json
+venv/
+__pycache__/
+*.pyc
