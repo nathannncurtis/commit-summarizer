@@ -45,14 +45,44 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 3. Configure environment
+### 3. Create the Slack app
+
+1. https://api.slack.com/apps → **Create New App** → From scratch, pick your workspace
+2. **OAuth & Permissions** → under *Bot Token Scopes* add `chat:write`,
+   `channels:history` (or `groups:history` for a private channel), `im:history`,
+   and `commands`
+3. **Install to Workspace**, then copy the **Bot User OAuth Token** (`xoxb-…`)
+   into `SLACK_BOT_TOKEN`
+4. **Basic Information** → copy the **Signing Secret** into `SLACK_SIGNING_SECRET`
+5. In Slack, `/invite @your-bot` to the target channel, then put the channel's ID
+   (right-click the channel → View channel details → bottom of the panel) in
+   `SLACK_ALLOWED_CHANNEL_ID`
+
+### 4. Configure environment
 
 ```bash
 cp .env.example .env
 # Edit .env with your actual values
 ```
 
-### 4. Run
+| Variable | Required | Purpose |
+|---|---|---|
+| `GITHUB_WEBHOOK_SECRET` | yes | HMAC secret shared with the GitHub webhook |
+| `SLACK_BOT_TOKEN` | yes* | Bot token (`xoxb-…`) — posts editable summaries |
+| `SLACK_WEBHOOK_URL` | no* | Legacy incoming webhook fallback (posts are not editable) |
+| `SLACK_SIGNING_SECRET` | yes | Verifies slash commands and Events API requests |
+| `SLACK_ALLOWED_CHANNEL_ID` | yes | Channel summaries post to; only channel `/pause`/`/resume` obeys |
+| `SLACK_ADMIN_USER_ID` | for DM edits | Slack member ID allowed to edit summaries via DM |
+| `OLLAMA_URL` | no | Ollama base URL (default `http://localhost:11434`) |
+| `OLLAMA_MODEL` | no | Model name (default `qwen2.5:3b`) |
+| `OLLAMA_TIMEOUT` | no | Request timeout in seconds (default `120`) |
+| `OLLAMA_KEEP_ALIVE` | no | `0` unloads model weights after each request (keeps them out of swap on small boxes); a duration like `5m` keeps them warm; empty = Ollama default. If set to `0`, raise `OLLAMA_TIMEOUT` to absorb cold loads |
+| `PORT` / `BIND_HOST` | no | Listen address (defaults `5000` / value in `.env.example`) |
+
+*At least one of `SLACK_BOT_TOKEN` / `SLACK_WEBHOOK_URL` must be set; the bot
+token wins when both are present.
+
+### 5. Run
 
 ```bash
 python app.py
@@ -78,7 +108,7 @@ RestartSec=5
 WantedBy=multi-user.target
 ```
 
-### 5. Configure GitHub webhook
+### 6. Configure GitHub webhook
 
 In your repo: Settings → Webhooks → Add webhook
 
@@ -89,7 +119,7 @@ In your repo: Settings → Webhooks → Add webhook
 | Secret | *(your GITHUB_WEBHOOK_SECRET)* |
 | Events | Just the push event |
 
-### 6. Configure Slack slash commands (optional)
+### 7. Configure Slack slash commands (optional)
 
 To pause and resume summaries from Slack, add two slash commands to your Slack app:
 
@@ -98,21 +128,18 @@ To pause and resume summaries from Slack, add two slash commands to your Slack a
    - Request URL: `https://your-domain.com/slack/command`
    - Save
 2. Repeat for `/resume` (same Request URL)
-3. **Basic Information** → copy the **Signing Secret** into `SLACK_SIGNING_SECRET`
-4. Get the channel ID where the commands are allowed (right-click the channel → View channel details → bottom of the panel) and put it in `SLACK_ALLOWED_CHANNEL_ID`
-5. Reinstall the app to your workspace if Slack prompts you
+3. Reinstall the app to your workspace if Slack prompts you
 
 When paused, the service still ACKs GitHub webhooks but skips the Ollama summary and the Slack post.
 
-### 7. Enable DM edits (optional)
+### 8. Enable DM edits (optional)
 
 Lets the configured maintainer fix a bad summary by DMing the bot — the bot
 rewrites the summary with Ollama (treating the DM as ground truth) and edits
 the original channel message in place.
 
-1. https://api.slack.com/apps → your app → **OAuth & Permissions** → add the
-   `im:history` bot scope (plus `chat:write` and `channels:history` if missing),
-   then reinstall the app
+1. https://api.slack.com/apps → your app → **OAuth & Permissions** → confirm the
+   `im:history` bot scope is present (reinstall the app if you just added it)
 2. **Event Subscriptions** → toggle **Enable Events** → Request URL:
    `https://your-domain.com/slack/events` (the service answers the verification
    challenge automatically — it must already be running)
