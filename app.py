@@ -518,5 +518,7 @@ def health():
 
 
 if __name__ == "__main__":
+    from waitress import serve
+
     logger.info("Starting commit-summarizer on %s:%d", BIND_HOST, PORT)
-    app.run(host=BIND_HOST, port=PORT)
+    serve(app, host=BIND_HOST, port=PORT)
